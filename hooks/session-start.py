@@ -1,19 +1,9 @@
 """
-SessionStart hook - injects knowledge base context into every conversation.
+SessionStart hook - injects wiki knowledge base context into every conversation.
 
-This is the "context injection" layer. When Claude Code starts a session,
-this hook reads the knowledge base index and recent daily log, then injects
-them as additional context so Claude always "remembers" what it has learned.
-
-Configure in .claude/settings.json:
-{
-    "hooks": {
-        "SessionStart": [{
-            "matcher": "",
-            "command": "uv run python hooks/session-start.py"
-        }]
-    }
-}
+Reads the knowledge base index and recent daily log from ~/Vaults/secondbrain/,
+then injects them as additional context so Claude always has access to
+compiled knowledge from past sessions.
 """
 
 import json
@@ -21,11 +11,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Paths relative to project root
+VAULT_DIR = Path.home() / "Vaults" / "secondbrain"
 ROOT = Path(__file__).resolve().parent.parent
-KNOWLEDGE_DIR = ROOT / "knowledge"
-DAILY_DIR = ROOT / "daily"
+KNOWLEDGE_DIR = VAULT_DIR / "Memory" / "knowledge"
+DAILY_DIR = VAULT_DIR / "Memory" / "daily"
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
+AGENTS_FILE = ROOT / "AGENTS.md"
 
 MAX_CONTEXT_CHARS = 20_000
 MAX_LOG_LINES = 30
@@ -40,7 +31,6 @@ def get_recent_log() -> str:
         log_path = DAILY_DIR / f"{date.strftime('%Y-%m-%d')}.md"
         if log_path.exists():
             lines = log_path.read_text(encoding="utf-8").splitlines()
-            # Return last N lines to keep context small
             recent = lines[-MAX_LOG_LINES:] if len(lines) > MAX_LOG_LINES else lines
             return "\n".join(recent)
 
@@ -51,20 +41,16 @@ def build_context() -> str:
     """Assemble the context to inject into the conversation."""
     parts = []
 
-    # Today's date
-    today = datetime.now(timezone.utc).astimezone()
-    parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
-
     # Knowledge base index (the core retrieval mechanism)
     if INDEX_FILE.exists():
         index_content = INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Knowledge Base Index\n\n{index_content}")
+        parts.append(f"## Wiki Knowledge Base Index\n\n{index_content}")
     else:
-        parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
+        parts.append("## Wiki Knowledge Base Index\n\n(empty - no articles compiled yet)")
 
     # Recent daily log
     recent_log = get_recent_log()
-    parts.append(f"## Recent Daily Log\n\n{recent_log}")
+    parts.append(f"## Recent Wiki Daily Log\n\n{recent_log}")
 
     context = "\n\n---\n\n".join(parts)
 

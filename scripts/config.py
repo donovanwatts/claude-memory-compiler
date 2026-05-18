@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 
 # ── Paths ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DAILY_DIR = ROOT_DIR / "daily"
-KNOWLEDGE_DIR = ROOT_DIR / "knowledge"
+VAULT_DIR = Path.home() / "Vaults" / "secondbrain"
+DAILY_DIR = VAULT_DIR / "Memory" / "daily"
+KNOWLEDGE_DIR = VAULT_DIR / "Memory" / "knowledge"
 CONCEPTS_DIR = KNOWLEDGE_DIR / "concepts"
 CONNECTIONS_DIR = KNOWLEDGE_DIR / "connections"
 QA_DIR = KNOWLEDGE_DIR / "qa"
-REPORTS_DIR = ROOT_DIR / "reports"
+REPORTS_DIR = VAULT_DIR / "Memory" / "reports"
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 HOOKS_DIR = ROOT_DIR / "hooks"
 AGENTS_FILE = ROOT_DIR / "AGENTS.md"
@@ -20,7 +21,7 @@ LOG_FILE = KNOWLEDGE_DIR / "log.md"
 STATE_FILE = SCRIPTS_DIR / "state.json"
 
 # ── Timezone ───────────────────────────────────────────────────────────
-TIMEZONE = "America/Chicago"
+TIMEZONE = "America/Denver"
 
 
 def now_iso() -> str:
