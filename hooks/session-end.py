@@ -1,9 +1,9 @@
 """
-SessionEnd hook - captures conversation transcript for memory extraction.
+SessionEnd hook - captures conversation transcript for wiki knowledge extraction.
 
-When a Claude Code session ends, this hook reads the transcript path from
-stdin, extracts conversation context, and spawns flush.py as a background
-process to extract knowledge into the daily log.
+When a Claude Code session ends, this hook reads the transcript,
+extracts conversation context, and spawns flush.py as a background
+process to extract knowledge into the wiki daily log.
 
 The hook itself does NO API calls - only local file I/O for speed (<10s).
 """
@@ -25,7 +25,6 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
     sys.exit(0)
 
 ROOT = Path(__file__).resolve().parent.parent
-DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
 STATE_DIR = SCRIPTS_DIR
 
@@ -86,14 +85,13 @@ def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
         context = context[-MAX_CONTEXT_CHARS:]
         boundary = context.find("\n**")
         if boundary > 0:
-            context = context[boundary + 1 :]
+            context = context[boundary + 1:]
 
     return context, len(recent)
 
 
 def main() -> None:
     # Read hook input from stdin
-    # Claude Code on Windows may pass paths with unescaped backslashes
     try:
         raw_input = sys.stdin.read()
         try:
@@ -154,16 +152,12 @@ def main() -> None:
         session_id,
     ]
 
-    # On Windows, use CREATE_NO_WINDOW to avoid flash console window.
-    # Do NOT use DETACHED_PROCESS — it breaks the Agent SDK's subprocess I/O.
-    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
     try:
         subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
+            start_new_session=True,
         )
         logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
     except Exception as e:

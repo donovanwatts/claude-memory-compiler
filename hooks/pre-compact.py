@@ -85,7 +85,7 @@ def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
         context = context[-MAX_CONTEXT_CHARS:]
         boundary = context.find("\n**")
         if boundary > 0:
-            context = context[boundary + 1 :]
+            context = context[boundary + 1:]
 
     return context, len(recent)
 
@@ -152,14 +152,12 @@ def main() -> None:
         session_id,
     ]
 
-    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
     try:
         subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
+            start_new_session=True,
         )
         logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
     except Exception as e:
