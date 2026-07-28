@@ -41,16 +41,26 @@ def build_context() -> str:
     """Assemble the context to inject into the conversation."""
     parts = []
 
-    # Knowledge base index (the core retrieval mechanism)
-    if INDEX_FILE.exists():
-        index_content = INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Wiki Knowledge Base Index\n\n{index_content}")
-    else:
-        parts.append("## Wiki Knowledge Base Index\n\n(empty - no articles compiled yet)")
+    # Daily log is NOT injected here — the second-brain SessionStart hook reads the
+    # same Memory/daily/ files and injects it along with today's date. Two copies of
+    # one log helped nobody.
 
-    # Recent daily log
-    recent_log = get_recent_log()
-    parts.append(f"## Recent Wiki Daily Log\n\n{recent_log}")
+    # Knowledge base: inject a pointer, not the index itself. The index is ~73KB of
+    # article titles; injecting it blew the whole 20K budget on a truncated alphabet
+    # and starved the daily log above. Claude reads it on demand instead.
+    if INDEX_FILE.exists():
+        article_count = sum(
+            1 for line in INDEX_FILE.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith("- [[")
+        )
+        parts.append(
+            "## Wiki Knowledge Base\n\n"
+            f"{article_count} compiled articles. Index: `{INDEX_FILE}`\n"
+            "Read that file (or grep it) when you need to look something up. "
+            "Articles link to each other with [[wikilinks]]."
+        )
+    else:
+        parts.append("## Wiki Knowledge Base\n\n(empty - no articles compiled yet)")
 
     context = "\n\n---\n\n".join(parts)
 
