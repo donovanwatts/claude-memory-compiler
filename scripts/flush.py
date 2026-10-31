@@ -6,7 +6,15 @@ pre-extracted conversation context from a .md file, uses the Claude Agent SDK
 to decide what's worth saving, and appends the result to today's daily log.
 
 Usage:
-    uv run python flush.py <context_file.md> <session_id>
+    uv run python flush.py <context_file.md> <session_id> [--date YYYY-MM-DD] [--time HH:MM]
+
+`--date` files the entry under that day's log instead of today's (used by
+scripts/backfill.py so a transcript lands on its own day). `--time` is the
+entry's clock label and defaults to now. Every entry starts with a
+`<!-- session: <id> -->` marker so a re-run can tell it has already been flushed.
+
+Exit codes: 0 written, 2 model error (nothing written to the vault),
+3 usage limit hit (nothing written; stdout carries `resets_at=<unix>` when known).
 """
 
 from __future__ import annotations
@@ -15,9 +23,11 @@ from __future__ import annotations
 import os
 os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
 
+import argparse
 import asyncio
 import json
 import logging
+import re
 import socket
 import sys
 import time
@@ -65,10 +75,20 @@ def save_flush_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
-def append_to_daily_log(content: str, section: str = "Session") -> None:
-    """Append content to today's daily log."""
+def session_marker(session_id: str) -> str:
+    return f"<!-- session: {session_id} -->"
+
+
+def append_to_daily_log(
+    content: str,
+    section: str = "Session",
+    session_id: str = "",
+    date: str | None = None,
+    time_str: str | None = None,
+) -> Path:
+    """Append content to the daily log for `date` (default today). Returns the path."""
     today = datetime.now(timezone.utc).astimezone()
-    date = today.strftime("%Y-%m-%d")
+    date = date or today.strftime("%Y-%m-%d")
     # One file per day per machine (vault convention since 2026-08: the host
     # suffix keeps two machines from editing the same file into a git conflict).
     host = socket.gethostname().split(".")[0].lower() or "unknown-host"
@@ -81,16 +101,21 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
             encoding="utf-8",
         )
 
-    time_str = today.strftime("%H:%M")
-    entry = f"### {section} ({time_str})\n\n{content}\n\n"
+    time_str = time_str or today.strftime("%H:%M")
+    marker = f"{session_marker(session_id)}\n" if session_id else ""
+    entry = f"### {section} ({time_str})\n\n{marker}{content}\n\n"
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(entry)
+    return log_path
+
+
+LIMIT_TEXT_RE = re.compile(r"hit your limit|usage limit|rate limit", re.I)
 
 
 async def run_flush(context: str) -> str:
     """Use Claude Agent SDK to extract important knowledge from conversation context."""
-    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, query
+    from claude_agent_sdk import AssistantMessage, RateLimitEvent, ResultMessage, TextBlock, query
 
     prompt = f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
@@ -125,6 +150,8 @@ respond with exactly: FLUSH_OK
 {context}"""
 
     response = ""
+    limit_hit = False
+    resets_at = None
 
     try:
         async for message in query(
@@ -142,6 +169,15 @@ respond with exactly: FLUSH_OK
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         response += block.text
+            elif isinstance(message, RateLimitEvent):
+                info = message.rate_limit_info
+                logging.info(
+                    "Rate limit %s type=%s utilization=%s resets_at=%s",
+                    info.status, info.rate_limit_type, info.utilization, info.resets_at,
+                )
+                if info.status == "rejected":
+                    limit_hit = True
+                    resets_at = info.resets_at
             elif isinstance(message, ResultMessage):
                 u = message.usage or {}
                 logging.info(
@@ -151,13 +187,19 @@ respond with exactly: FLUSH_OK
                     u.get("cache_read_input_tokens"), u.get("output_tokens"),
                 )
                 if message.is_error:
-                    response = f"FLUSH_ERROR: result subtype={message.subtype}"
+                    text = (message.result or "")[:200]
+                    if LIMIT_TEXT_RE.search(text):
+                        limit_hit = True
+                    response = f"FLUSH_ERROR: result subtype={message.subtype} {text}".strip()
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
         response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
 
+    if limit_hit:
+        response = f"FLUSH_PAUSED resets_at={resets_at or ''}"
     return response
+
 
 
 COMPILE_AFTER_HOUR = 18  # 6 PM local time
@@ -213,13 +255,24 @@ def maybe_trigger_compilation() -> None:
         logging.error("Failed to spawn compile.py: %s", e)
 
 
-def main():
-    if len(sys.argv) < 3:
-        logging.error("Usage: %s <context_file.md> <session_id>", sys.argv[0])
-        sys.exit(1)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Flush one session's context into the daily log")
+    parser.add_argument("context_file", type=Path)
+    parser.add_argument("session_id")
+    parser.add_argument("--date", help="YYYY-MM-DD to file the entry under (default: today)")
+    parser.add_argument("--time", help="HH:MM label for the entry (default: now)")
+    args = parser.parse_args(argv)
+    if args.date:
+        datetime.strptime(args.date, "%Y-%m-%d")
+    if args.time:
+        datetime.strptime(args.time, "%H:%M")
+    return args
 
-    context_file = Path(sys.argv[1])
-    session_id = sys.argv[2]
+
+def main():
+    args = parse_args()
+    context_file: Path = args.context_file
+    session_id: str = args.session_id
 
     logging.info("flush.py started for session %s, context: %s", session_id, context_file)
 
@@ -249,18 +302,28 @@ def main():
     # Run the LLM extraction
     response = asyncio.run(run_flush(context))
 
-    # Append to daily log
+    # A failed call writes nothing to the vault: the context file is kept so the
+    # caller (hook or backfill) can retry, and the exit code says why.
+    if response.startswith("FLUSH_PAUSED"):
+        logging.warning("Result: %s (usage limit; nothing written)", response)
+        print(response)
+        sys.exit(3)
+    if "FLUSH_ERROR" in response:
+        logging.error("Result: %s (nothing written)", response)
+        print(response)
+        sys.exit(2)
+
     if "FLUSH_OK" in response:
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
-            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
+            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush",
+            session_id, args.date, args.time,
         )
-    elif "FLUSH_ERROR" in response:
-        logging.error("Result: %s", response)
-        append_to_daily_log(response, "Memory Flush")
+        print("FLUSH_OK")
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
-        append_to_daily_log(response, "Session")
+        append_to_daily_log(response, "Session", session_id, args.date, args.time)
+        print(f"SAVED {len(response)} chars")
 
     # Update dedup state
     save_flush_state({"session_id": session_id, "timestamp": time.time()})
@@ -270,7 +333,9 @@ def main():
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.
-    maybe_trigger_compilation()
+    # A backfill (--date) compiles separately, so it never triggers this.
+    if not args.date:
+        maybe_trigger_compilation()
 
     logging.info("Flush complete for session %s", session_id)
 
