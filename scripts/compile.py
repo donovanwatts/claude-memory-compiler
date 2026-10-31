@@ -4,7 +4,7 @@ Compile daily conversation logs into structured knowledge articles.
 This is the "LLM compiler" - it reads daily logs (source code) and produces
 organized knowledge articles (the executable).
 
-Usage:
+Usage (exit 3 means the usage window is exhausted; re-run after it resets):
     uv run python compile.py                    # compile new/changed logs only
     uv run python compile.py --all              # force recompile everything
     uv run python compile.py --file daily/2026-04-01.md  # compile a specific log
@@ -63,6 +63,7 @@ FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 TYPE_RE = re.compile(r"^type:\s*\S+", re.M)
 GENERATED_RE = re.compile(r"^generated:", re.M)
 BRACKET_HEADING_RE = re.compile(r"^##\s+\[(\d{4}-\d{2}-\d{2})[^\]]*\]\s*$", re.M)
+LIMIT_TEXT_RE = re.compile(r"hit your limit|usage limit|rate limit", re.I)
 
 
 def build_prompt(log_path: Path, log_content: str, schema: str, wiki_index: str) -> str:
@@ -202,12 +203,21 @@ def reindex() -> str:
     return f"  Index: okf_reindex.py exit {result.returncode} {first[0] if first else ''}"
 
 
+class UsageLimitHit(Exception):
+    """The Claude Max usage window is exhausted; nothing was written."""
+
+    def __init__(self, resets_at: int | None):
+        super().__init__(f"usage limit hit, resets_at={resets_at or ''}")
+        self.resets_at = resets_at
+
+
 async def compile_daily_log(log_path: Path, state: dict) -> float:
     """Compile a single daily log into knowledge articles.
 
     Returns the SDK-reported cost (notional on a Max login - nothing is billed).
+    Raises UsageLimitHit when the CLI reports the usage window is exhausted.
     """
-    from claude_agent_sdk import ResultMessage, query
+    from claude_agent_sdk import RateLimitEvent, ResultMessage, query
 
     log_content = log_path.read_text(encoding="utf-8")
     schema = AGENTS_FILE.read_text(encoding="utf-8")
@@ -218,6 +228,8 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     started = time.time()
     usage = {}
     error = None
+    limit_hit = False
+    resets_at = None
 
     try:
         async for message in query(
@@ -235,15 +247,26 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
                 model=COMPILE_MODEL,
             ),
         ):
-            if isinstance(message, ResultMessage):
+            if isinstance(message, RateLimitEvent):
+                info = message.rate_limit_info
+                if info.status == "rejected":
+                    limit_hit = True
+                    resets_at = info.resets_at
+            elif isinstance(message, ResultMessage):
                 cost = message.total_cost_usd or 0.0
                 usage = message.usage or {}
                 if message.is_error:
-                    error = f"result is_error subtype={message.subtype}"
+                    text = (message.result or "")[:200]
+                    if LIMIT_TEXT_RE.search(text):
+                        limit_hit = True
+                    error = f"result is_error subtype={message.subtype} {text}".strip()
     except Exception as e:  # noqa: BLE001 - one line in the log is the contract
         error = f"{type(e).__name__}: {e}"
 
     elapsed = time.time() - started
+    if limit_hit:
+        print(f"  PAUSED: usage limit hit, resets_at={resets_at or ''} ({elapsed:.0f}s)")
+        raise UsageLimitHit(resets_at)
     if error:
         print(f"  ERROR: {error} ({elapsed:.0f}s)")
         return 0.0
@@ -315,14 +338,23 @@ def main():
         return
 
     total_cost = 0.0
+    paused: UsageLimitHit | None = None
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        total_cost += asyncio.run(compile_daily_log(log_path, state))
+        try:
+            total_cost += asyncio.run(compile_daily_log(log_path, state))
+        except UsageLimitHit as hit:
+            paused = hit
+            break
 
     print(reindex())
     articles = list_wiki_articles()
-    print(f"\nCompilation complete. Total cost: ${total_cost:.2f} (notional)")
+    print(f"\nCompilation {'paused' if paused else 'complete'}. Total cost: ${total_cost:.2f} (notional)")
     print(f"Knowledge base: {len(articles)} articles")
+    if paused:
+        # Exit 3 so a driver (scripts/backfill.py) can wait for the window and resume.
+        print(f"PAUSED resets_at={paused.resets_at or ''}")
+        sys.exit(3)
 
 
 if __name__ == "__main__":

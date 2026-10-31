@@ -392,7 +392,11 @@ This ensures flush.py survives after Claude Code's hook process exits.
 3. Skips if context is empty or if same session was flushed within 60 seconds (deduplication)
 4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`)
 5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
-6. Appends result to `daily/YYYY-MM-DD.md`
+6. Appends result to `daily/YYYY-MM-DD-<host>.md`, each entry prefixed with a
+   `<!-- session: <id> -->` marker. `--date YYYY-MM-DD` (and `--time HH:MM`) file the
+   entry on another day; `scripts/backfill.py` uses that to replay old transcripts onto
+   their own day. A failed call writes nothing to the vault: exit 2 on a model error,
+   exit 3 when the usage window is exhausted (`compile.py` exits 3 the same way).
 7. Cleans up temp context file
 8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger.
 
@@ -495,7 +499,18 @@ Reports saved to `reports/lint-YYYY-MM-DD.md`.
 - `last_lint` - timestamp of most recent lint
 - `total_cost` - cumulative API cost
 
-`scripts/last-flush.json` tracks flush deduplication (session_id + timestamp).
+`last-flush.json` tracks flush deduplication (session_id + timestamp).
+
+### Backfill (`scripts/backfill.py`)
+
+Replays `~/.claude/projects/*/*.jsonl` through flush (one call per transcript, dated by
+the transcript's first timestamp in `TIMEZONE`) and then compiles each new or changed
+daily log with `compile.py --file`. Same guards as the session-capture hook: linked git
+worktrees (and deleted worktree paths), compiler-spawned sessions, and days the old hook
+already flushed are skipped; today is left to the live hook unless `--include-today`.
+Idempotent via the session marker and `backfill-state.json`; on exit 3 it sleeps until the
+usage window resets and retries the same item. Progress: `backfill.log` in the state dir.
+`--dry-run` lists the plan with no model call.
 
 Both are gitignored and regenerated automatically.
 
