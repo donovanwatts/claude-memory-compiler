@@ -26,10 +26,13 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
-STATE_DIR = SCRIPTS_DIR
+sys.path.insert(0, str(SCRIPTS_DIR))
+from config import FLUSH_LOG, STATE_DIR, ensure_state_dir  # noqa: E402
+
+ensure_state_dir()
 
 logging.basicConfig(
-    filename=str(SCRIPTS_DIR / "flush.log"),
+    filename=str(FLUSH_LOG),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [pre-compact] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",

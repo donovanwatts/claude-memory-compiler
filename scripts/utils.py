@@ -14,6 +14,7 @@ from config import (
     LOG_FILE,
     QA_DIR,
     STATE_FILE,
+    ensure_state_dir,
 )
 
 
@@ -21,6 +22,7 @@ from config import (
 
 def load_state() -> dict:
     """Load persistent state from state.json."""
+    ensure_state_dir()
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     return {"ingested": {}, "query_count": 0, "last_lint": None, "total_cost": 0.0}
@@ -28,6 +30,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     """Save state to state.json."""
+    ensure_state_dir()
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -65,10 +68,21 @@ def wiki_article_exists(link: str) -> bool:
 # ── Wiki content helpers ──────────────────────────────────────────────
 
 def read_wiki_index() -> str:
-    """Read the knowledge base index file."""
-    if INDEX_FILE.exists():
-        return INDEX_FILE.read_text(encoding="utf-8")
-    return "# Knowledge Base Index\n\n| Article | Summary | Compiled From | Updated |\n|---------|---------|---------------|---------|"
+    """Read the OKF progressive-disclosure indexes the compiler needs.
+
+    okf_reindex.py writes a short root index.md (top-level docs plus one line
+    per directory) and a full catalog in each subdirectory's index.md. The
+    compiler needs the article catalogs, so this returns root + concepts +
+    connections + qa indexes concatenated.
+    """
+    parts = []
+    for path in [INDEX_FILE] + [d / "index.md" for d in (CONCEPTS_DIR, CONNECTIONS_DIR, QA_DIR)]:
+        if path.exists():
+            rel = path.relative_to(KNOWLEDGE_DIR).as_posix()
+            parts.append(f"### {rel}\n\n{path.read_text(encoding='utf-8')}")
+    if not parts:
+        return "# Knowledge Base Index\n\n(empty - run okf_reindex.py)\n"
+    return "\n\n".join(parts)
 
 
 def read_all_wiki_content() -> str:
@@ -127,7 +141,12 @@ def get_article_word_count(path: Path) -> int:
     return len(content.split())
 
 
-def build_index_entry(rel_path: str, summary: str, sources: str, updated: str) -> str:
-    """Build a single index table row."""
-    link = rel_path.replace(".md", "")
-    return f"| [[{link}]] | {summary} | {sources} | {updated} |"
+def build_index_entry(title: str, rel_path: str, description: str) -> str:
+    """Build one OKF index entry: `* [Title](path.md) - description`.
+
+    Standard markdown link, never a wikilink, so non-Obsidian consumers can
+    traverse the bundle (SCHEMA.md rule 5). The compiler itself no longer
+    writes index.md (okf_reindex.py owns it); this stays for callers that
+    need a single conformant line.
+    """
+    return f"* [{title}]({rel_path}) - {description}"

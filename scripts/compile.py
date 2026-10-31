@@ -9,16 +9,45 @@ Usage:
     uv run python compile.py --all              # force recompile everything
     uv run python compile.py --file daily/2026-04-01.md  # compile a specific log
     uv run python compile.py --dry-run          # show what would be compiled
+
+Output contract (secondbrain#22): every page the compiler writes carries a
+non-empty `type` and an OKF v0.2 `generated` field; log.md headings are plain
+`## YYYY-MM-DD`; index.md is never written by the model - the vault's
+okf_reindex.py regenerates it after each run, so there is one index writer.
 """
 
 from __future__ import annotations
 
+# Recursion guard: the SDK runs the Claude Code CLI, which fires the user's
+# SessionEnd/PreCompact hooks, which would spawn another flush. Set before
+# any import that could reach Claude.
+import os
+os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
+
 import argparse
 import asyncio
+import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
+from config import (
+    AGENTS_FILE,
+    COMPILE_MODEL,
+    COMPILER_ACTOR,
+    CONCEPTS_DIR,
+    CONNECTIONS_DIR,
+    DAILY_DIR,
+    KNOWLEDGE_DIR,
+    LOG_FILE,
+    OKF_REINDEX,
+    VAULT_DIR,
+    lean_sdk_options,
+    now_iso,
+    now_utc_iso,
+    today_iso,
+)
 from utils import (
     file_hash,
     list_raw_files,
@@ -28,43 +57,19 @@ from utils import (
     save_state,
 )
 
-# ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
+FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
+TYPE_RE = re.compile(r"^type:\s*\S+", re.M)
+GENERATED_RE = re.compile(r"^generated:", re.M)
+BRACKET_HEADING_RE = re.compile(r"^##\s+\[(\d{4}-\d{2}-\d{2})[^\]]*\]\s*$", re.M)
 
-async def compile_daily_log(log_path: Path, state: dict) -> float:
-    """Compile a single daily log into knowledge articles.
 
-    Returns the API cost of the compilation.
-    """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
-    log_content = log_path.read_text(encoding="utf-8")
-    schema = AGENTS_FILE.read_text(encoding="utf-8")
-    wiki_index = read_wiki_index()
-
-    # Read existing articles for context
-    existing_articles_context = ""
-    existing = {}
-    for article_path in list_wiki_articles():
-        rel = article_path.relative_to(KNOWLEDGE_DIR)
-        existing[str(rel)] = article_path.read_text(encoding="utf-8")
-
-    if existing:
-        parts = []
-        for rel_path, content in existing.items():
-            parts.append(f"### {rel_path}\n```markdown\n{content}\n```")
-        existing_articles_context = "\n\n".join(parts)
-
+def build_prompt(log_path: Path, log_content: str, schema: str, wiki_index: str) -> str:
     timestamp = now_iso()
-
-    prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
+    date = timestamp[:10]
+    generated_at = now_utc_iso()
+    return f"""You are a knowledge compiler. Your job is to read a daily conversation log
 and extract knowledge into structured wiki articles.
 
 ## Schema (AGENTS.md)
@@ -73,11 +78,13 @@ and extract knowledge into structured wiki articles.
 
 ## Current Wiki Index
 
+The index below lists every existing article as `* [Title](path.md) - description`.
+Use it to decide whether a concept already exists. To read an existing article,
+use the Read tool on `{KNOWLEDGE_DIR}/<path>`; to find candidates by keyword, use
+Grep over `{KNOWLEDGE_DIR}/concepts` and `{KNOWLEDGE_DIR}/connections`. Do not
+read every article - read the handful that the log plausibly touches.
+
 {wiki_index}
-
-## Existing Wiki Articles
-
-{existing_articles_context if existing_articles_context else "(No existing articles yet)"}
 
 ## Daily Log to Compile
 
@@ -91,41 +98,41 @@ Read the daily log above and compile it into wiki articles following the schema 
 
 ### Rules:
 
-1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
-2. **Create concept articles** in `knowledge/concepts/` - One .md file per concept
+1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article.
+   If the log contains nothing durable (a FLUSH_OK stub, routine chatter), write
+   nothing except the log.md entry and say so.
+2. **Create concept articles** in `{CONCEPTS_DIR}` - One .md file per concept
    - Use the exact article format from AGENTS.md (YAML frontmatter + sections)
-   - Include `type:` in frontmatter (`concept` or `connection`) - required for OKF conformance
-   - Include `sources:` in frontmatter pointing to the daily log file
+   - Frontmatter MUST include all of: `type: concept`, `title`, `tags`, `sources`,
+     `created`, `updated`, `status: draft`, and
+     `generated: {{ by: "{COMPILER_ACTOR}", at: {generated_at} }}`
+   - `sources:` points to the daily log file (`daily/{log_path.name}`)
    - Use `[[concepts/slug]]` wikilinks to link to related concepts
+   - Prefer tags that already appear in the index; 2-5 tags per page
    - Write in encyclopedia style - neutral, comprehensive
-3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
-   relationships between 2+ existing concepts
+3. **Create connection articles** in `{CONNECTIONS_DIR}` (`type: connection`) if this
+   log reveals non-obvious relationships between 2+ existing concepts
 4. **Update existing articles** if this log adds new information to concepts already in the wiki
-   - Read the existing article, add the new information, add the source to frontmatter
-5. **Update knowledge/index.md** - Add new entries to the table
-   - Each entry: `| [Title](path/slug.md) | One-line summary | source-file | {timestamp[:10]} |`
-   - Index entries use standard markdown links, not [[wikilinks]], so non-Obsidian
-     consumers can traverse the bundle (wikilinks stay fine inside article bodies)
-6. **Append to knowledge/log.md** - Add an entry under a plain ISO date heading:
+   - Read the existing article, add the new information, add the source to frontmatter,
+     bump `updated`, and keep every existing frontmatter field (add `type` if it is missing)
+5. **Do NOT write or edit `index.md` anywhere.** The index is regenerated by a separate
+   tool after you finish. Editing it by hand is a conformance violation.
+6. **Append to `{LOG_FILE}`** - Add an entry at the END of the file under a plain
+   ISO date heading, exactly this shape:
    ```
-   ## {timestamp[:10]}
+   ## {date}
 
    - {timestamp} compile | {log_path.name}
    - Source: daily/{log_path.name}
    - Articles created: [[concepts/x]], [[concepts/y]]
    - Articles updated: [[concepts/z]] (if any)
    ```
-   Repeating a date heading for a second run on the same day is fine. Never use
-   bracketed headings like `## [{timestamp}]`.
-
-### File paths:
-- Write concept articles to: {CONCEPTS_DIR}
-- Write connection articles to: {CONNECTIONS_DIR}
-- Update index at: {KNOWLEDGE_DIR / 'index.md'}
-- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+   Use the Edit tool or Write with the full existing content plus your entry; never
+   truncate log.md. Repeating a date heading for a second run on the same day is fine.
+   Never use bracketed headings like `## [{timestamp}]`.
 
 ### Quality standards:
-- Every article must have complete YAML frontmatter
+- Every article must have complete YAML frontmatter (see rule 2)
 - Every article must link to at least 2 other articles via [[wikilinks]]
 - Key Points section should have 3-5 bullet points
 - Details section should have 2+ paragraphs
@@ -133,40 +140,135 @@ Read the daily log above and compile it into wiki articles following the schema 
 - Sources section should cite the daily log with specific claims extracted
 """
 
+
+def ensure_okf_frontmatter(since: float) -> list[str]:
+    """Deterministic post-pass: every article touched since `since` gets a
+    non-empty `type` (from its directory) and a `generated` field if missing.
+    The prompt asks for both; this makes the contract hold even when the model
+    forgets. Returns the paths it repaired."""
+    repaired: list[str] = []
+    for article in list_wiki_articles():
+        if article.stat().st_mtime < since:
+            continue
+        text = article.read_text(encoding="utf-8")
+        m = FM_RE.match(text)
+        if not m:
+            kind = article.parent.name.rstrip("s") if article.parent.name != "qa" else "qa"
+            text = (
+                f"---\ntype: {kind}\ntitle: {article.stem}\n"
+                f"generated: {{ by: \"{COMPILER_ACTOR}\", at: {now_utc_iso()} }}\n---\n" + text
+            )
+            article.write_text(text, encoding="utf-8")
+            repaired.append(str(article.relative_to(KNOWLEDGE_DIR)))
+            continue
+        fm = m.group(1)
+        additions = []
+        if not TYPE_RE.search(fm):
+            kind = {"concepts": "concept", "connections": "connection", "qa": "qa"}.get(
+                article.parent.name, "concept"
+            )
+            additions.append(f"type: {kind}")
+        if not GENERATED_RE.search(fm):
+            additions.append(f'generated: {{ by: "{COMPILER_ACTOR}", at: {now_utc_iso()} }}')
+        if additions:
+            new_fm = fm + "\n" + "\n".join(additions)
+            article.write_text(text[: m.start(1)] + new_fm + text[m.end(1):], encoding="utf-8")
+            repaired.append(str(article.relative_to(KNOWLEDGE_DIR)))
+    return repaired
+
+
+def normalize_log_headings() -> int:
+    """Rewrite any `## [YYYY-MM-DD...]` heading in log.md to `## YYYY-MM-DD`."""
+    if not LOG_FILE.exists():
+        return 0
+    text = LOG_FILE.read_text(encoding="utf-8")
+    new_text, n = BRACKET_HEADING_RE.subn(r"## \1", text)
+    if n:
+        LOG_FILE.write_text(new_text, encoding="utf-8")
+    return n
+
+
+def reindex() -> str:
+    """Defer index.md generation to the vault's okf_reindex.py (single writer)."""
+    if not OKF_REINDEX.exists():
+        return f"  Index: {OKF_REINDEX} not found; index.md left untouched"
+    result = subprocess.run(
+        [sys.executable, "-I", str(OKF_REINDEX)],
+        capture_output=True,
+        text=True,
+        cwd=str(KNOWLEDGE_DIR),
+    )
+    first = (result.stdout or result.stderr).strip().splitlines()[:1]
+    return f"  Index: okf_reindex.py exit {result.returncode} {first[0] if first else ''}"
+
+
+async def compile_daily_log(log_path: Path, state: dict) -> float:
+    """Compile a single daily log into knowledge articles.
+
+    Returns the SDK-reported cost (notional on a Max login - nothing is billed).
+    """
+    from claude_agent_sdk import ResultMessage, query
+
+    log_content = log_path.read_text(encoding="utf-8")
+    schema = AGENTS_FILE.read_text(encoding="utf-8")
+    wiki_index = read_wiki_index()
+    prompt = build_prompt(log_path, log_content, schema, wiki_index)
+
     cost = 0.0
+    started = time.time()
+    usage = {}
+    error = None
 
     try:
         async for message in query(
             prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT_DIR),
-                system_prompt={"type": "preset", "preset": "claude_code"},
+            options=lean_sdk_options(
+                cwd=str(VAULT_DIR),
+                add_dirs=[str(KNOWLEDGE_DIR)],
+                system_prompt=(
+                    "You are a careful, terse knowledge-base compiler. You write files "
+                    "with the tools you are given and report what you wrote in one paragraph."
+                ),
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
-                max_turns=30,
+                max_turns=40,
+                model=COMPILE_MODEL,
             ),
         ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        pass  # compilation output - LLM writes files directly
-            elif isinstance(message, ResultMessage):
+            if isinstance(message, ResultMessage):
                 cost = message.total_cost_usd or 0.0
-                print(f"  Cost: ${cost:.4f}")
-    except Exception as e:
-        print(f"  Error: {e}")
+                usage = message.usage or {}
+                if message.is_error:
+                    error = f"result is_error subtype={message.subtype}"
+    except Exception as e:  # noqa: BLE001 - one line in the log is the contract
+        error = f"{type(e).__name__}: {e}"
+
+    elapsed = time.time() - started
+    if error:
+        print(f"  ERROR: {error} ({elapsed:.0f}s)")
         return 0.0
 
-    # Update state
-    rel_path = log_path.name
-    state.setdefault("ingested", {})[rel_path] = {
+    repaired = ensure_okf_frontmatter(started)
+    fixed_headings = normalize_log_headings()
+    print(
+        f"  Cost: ${cost:.4f} (notional, Max login)  time: {elapsed:.0f}s  "
+        f"in={usage.get('input_tokens', 0)} cache_create={usage.get('cache_creation_input_tokens', 0)} "
+        f"cache_read={usage.get('cache_read_input_tokens', 0)} out={usage.get('output_tokens', 0)}"
+    )
+    if repaired:
+        print(f"  Frontmatter repaired on {len(repaired)}: {', '.join(repaired)}")
+    if fixed_headings:
+        print(f"  log.md: rewrote {fixed_headings} bracketed heading(s)")
+
+    state.setdefault("ingested", {})[log_path.name] = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
         "cost_usd": cost,
+        "seconds": round(elapsed),
+        "model": COMPILE_MODEL,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + cost
     save_state(state)
-
     return cost
 
 
@@ -179,13 +281,11 @@ def main():
 
     state = load_state()
 
-    # Determine which files to compile
     if args.file:
         target = Path(args.file)
         if not target.is_absolute():
             target = DAILY_DIR / target.name
         if not target.exists():
-            # Try resolving relative to project root
             target = ROOT_DIR / args.file
         if not target.exists():
             print(f"Error: {args.file} not found")
@@ -198,8 +298,7 @@ def main():
         else:
             to_compile = []
             for log_path in all_logs:
-                rel = log_path.name
-                prev = state.get("ingested", {}).get(rel, {})
+                prev = state.get("ingested", {}).get(log_path.name, {})
                 if not prev or prev.get("hash") != file_hash(log_path):
                     to_compile.append(log_path)
 
@@ -207,23 +306,22 @@ def main():
         print("Nothing to compile - all daily logs are up to date.")
         return
 
-    print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
+    print(f"{'[DRY RUN] ' if args.dry_run else ''}{today_iso()} vault={VAULT_DIR} model={COMPILE_MODEL}")
+    print(f"Files to compile ({len(to_compile)}):")
     for f in to_compile:
         print(f"  - {f.name}")
 
     if args.dry_run:
         return
 
-    # Compile each file sequentially
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
-        total_cost += cost
-        print(f"  Done.")
+        total_cost += asyncio.run(compile_daily_log(log_path, state))
 
+    print(reindex())
     articles = list_wiki_articles()
-    print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+    print(f"\nCompilation complete. Total cost: ${total_cost:.2f} (notional)")
     print(f"Knowledge base: {len(articles)} articles")
 
 

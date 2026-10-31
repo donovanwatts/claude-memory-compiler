@@ -82,22 +82,21 @@ The schema that tells the LLM how to compile and maintain the knowledge base. Th
 
 ### `knowledge/index.md` - Master Catalog
 
-A table listing every knowledge article. This is the primary retrieval mechanism - the LLM reads this FIRST when answering any query, then selects relevant articles to read in full.
+A catalog of every knowledge article. This is the primary retrieval mechanism - the LLM reads this FIRST when answering any query, then selects relevant articles to read in full.
 
-Format:
+**The compiler never writes index.md.** The vault's `Memory/knowledge/_tools/okf_reindex.py`
+is the single index writer: `compile.py` calls it after every run, and the prompt forbids the
+model from touching any `index.md`. It writes a short root index (top-level docs plus one line
+per directory) and a full catalog in each subdirectory's `index.md`, one entry per article:
 
 ```markdown
-# Knowledge Base Index
-
-| Article | Summary | Compiled From | Updated |
-|---------|---------|---------------|---------|
-| [Supabase Auth](concepts/supabase-auth.md) | Row-level security patterns and JWT gotchas | daily/2026-04-02.md | 2026-04-02 |
-| [Auth and Webhooks](connections/auth-and-webhooks.md) | Token verification patterns shared across Supabase auth and Stripe webhooks | daily/2026-04-02.md, daily/2026-04-04.md | 2026-04-04 |
+* [Supabase Auth](supabase-auth.md) - Row-level security patterns and JWT gotchas
+```
 
 Index entries use standard markdown links, not `[[wikilinks]]`, so any OKF-aware
 consumer (not just Obsidian) can traverse the bundle. Wikilinks remain the linking
-style inside article bodies.
-```
+style inside article bodies. `utils.read_wiki_index()` returns root + concepts +
+connections + qa indexes concatenated, which is what the compile prompt sees.
 
 ### `knowledge/log.md` - Build Log
 
@@ -145,6 +144,8 @@ sources:
   - "daily/2026-04-03.md"
 created: 2026-04-01
 updated: 2026-04-03
+status: draft
+generated: { by: "claude-memory-compiler/0.2", at: 2026-04-03T17:00:00Z }
 ---
 
 # Concept Name
@@ -184,6 +185,8 @@ sources:
   - "daily/2026-04-04.md"
 created: 2026-04-04
 updated: 2026-04-04
+status: draft
+generated: { by: "claude-memory-compiler/0.2", at: 2026-04-04T17:00:00Z }
 ---
 
 # Connection: X and Y
@@ -253,8 +256,8 @@ When processing a daily log:
    - If an existing concept article covers this topic: UPDATE it with new information, add the daily log as a source
    - If it's a new topic: CREATE a new `concepts/` article
 5. If the log reveals a non-obvious connection between 2+ existing concepts: CREATE a `connections/` article
-6. UPDATE `knowledge/index.md` with new/modified entries
-7. APPEND to `knowledge/log.md`
+6. APPEND to `knowledge/log.md` under a plain `## YYYY-MM-DD` heading
+7. (compile.py, not the model) run `okf_reindex.py` to regenerate every `index.md`
 
 **Important guidelines:**
 - A single daily log may touch 3-10 knowledge articles
@@ -296,7 +299,7 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 - **Writing style:** Encyclopedia-style, factual, third-person where appropriate
 - **Dates:** ISO 8601 (YYYY-MM-DD for dates, full ISO for timestamps in log.md)
 - **File naming:** lowercase, hyphens for spaces (e.g., `supabase-row-level-security.md`)
-- **Frontmatter:** Every article must have YAML frontmatter with at minimum: title, sources, created, updated
+- **Frontmatter:** Every article must have YAML frontmatter with at minimum: type, title, sources, created, updated, and an OKF v0.2 `generated: { by, at }`. `compile.py` runs a deterministic post-pass that adds a missing `type` (from the directory) and `generated` to any article it touched, so the bundle validates even when the model forgets
 - **Sources:** Always link back to the daily log(s) that contributed to an article
 
 ---
@@ -427,11 +430,16 @@ async for message in query(
 ):
 ```
 
-- Builds a prompt with: AGENTS.md schema, current index, all existing articles, and the daily log
+- Builds a prompt with: AGENTS.md schema, the OKF indexes, and the daily log. Existing
+  articles are NOT inlined (at 1,000 articles that was 16 MB and the CLI exited 1); the
+  model reads the few it needs with Read/Grep
 - Claude reads the daily log, decides what concepts to extract, and writes files directly
 - `permission_mode="acceptEdits"` auto-approves all file operations
+- After the model finishes: `ensure_okf_frontmatter()` adds any missing `type`/`generated`,
+  `normalize_log_headings()` rewrites bracketed log headings, and `okf_reindex.py` runs
 - Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
-- Cost: ~$0.45-0.65 per daily log (increases as KB grows)
+- Model: `claude-sonnet-5-5` (`WIKI_COMPILE_MODEL`). Measured 2026-10-31 on a 1,000-article
+  bundle: 24 s, ~$0.86 notional per daily log (nothing is billed - see Billing below)
 
 **CLI:**
 ```bash
@@ -501,7 +509,29 @@ Both are gitignored and regenerated automatically.
 - `tzdata>=2024.1` - Timezone data
 - Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
 
-No API key needed - uses Claude Code's built-in credentials at `~/.claude/.credentials.json`.
+## Billing
+
+Every model call goes through the Claude Agent SDK, which runs the bundled Claude Code CLI
+with the user's interactive Claude Max login (macOS Keychain item `Claude Code-credentials`).
+No `ANTHROPIC_API_KEY` is read, set, or required anywhere in this repo, and `--bare` is
+deliberately not used because it disables OAuth. The `cost_usd` numbers the SDK reports are
+notional API-equivalent figures, not charges.
+
+`config.lean_sdk_options()` runs every call with `setting_sources=[]`, no MCP servers
+(`--strict-mcp-config`), no skills and no session persistence. Measured 2026-10-31: a
+one-word call with default options pulled 540k tokens of the user's MCP tool definitions
+and CLAUDE.md into context; with the lean options it is 23k (flush) to 50k (compile).
+
+## Paths and overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WIKI_VAULT_DIR` | `~/Vaults/secondbrain` | vault root; `Memory/daily` and `Memory/knowledge` hang off it |
+| `WIKI_STATE_DIR` | `~/.local/state/wiki-compiler` | `state.json`, `last-flush.json`, `flush.log`, `compile.log`, `hook.log`, temp context files |
+| `WIKI_COMPILE_MODEL` | `claude-sonnet-5-5` | compile model |
+| `WIKI_FLUSH_MODEL` | `claude-sonnet-5-5` | flush model |
+
+Point both `WIKI_*_DIR` variables at a scratch copy to run the pipeline without touching the live vault.
 
 ---
 
@@ -509,12 +539,12 @@ No API key needed - uses Claude Code's built-in credentials at `~/.claude/.crede
 
 | Operation | Cost |
 |-----------|------|
-| Compile one daily log | $0.45-0.65 |
+| Compile one daily log | ~$0.86 notional at 1,000 articles (24 s, Sonnet) |
 | Query (no file-back) | ~$0.15-0.25 |
 | Query (with file-back) | ~$0.25-0.40 |
 | Full lint (with contradictions) | ~$0.15-0.25 |
 | Structural lint only | $0.00 |
-| Memory flush (per session) | ~$0.02-0.05 |
+| Memory flush (per session) | ~$0.15 notional (2-5 s, Sonnet, 23k cached tokens) |
 
 ---
 
