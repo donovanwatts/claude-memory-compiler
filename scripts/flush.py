@@ -18,17 +18,28 @@ os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
 import asyncio
 import json
 import logging
+import socket
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from config import (
+    COMPILE_LOG,
+    DAILY_DIR,
+    FLUSH_LOG,
+    FLUSH_MODEL,
+    FLUSH_STATE_FILE,
+    STATE_FILE as COMPILE_STATE_FILE,
+    ensure_state_dir,
+    lean_sdk_options,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
-VAULT_DIR = Path.home() / "Vaults" / "secondbrain"
-DAILY_DIR = VAULT_DIR / "Memory" / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
-STATE_FILE = SCRIPTS_DIR / "last-flush.json"
-LOG_FILE = SCRIPTS_DIR / "flush.log"
+STATE_FILE = FLUSH_STATE_FILE
+LOG_FILE = FLUSH_LOG
+ensure_state_dir()
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -57,12 +68,16 @@ def save_flush_state(state: dict) -> None:
 def append_to_daily_log(content: str, section: str = "Session") -> None:
     """Append content to today's daily log."""
     today = datetime.now(timezone.utc).astimezone()
-    log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
+    date = today.strftime("%Y-%m-%d")
+    # One file per day per machine (vault convention since 2026-08: the host
+    # suffix keeps two machines from editing the same file into a git conflict).
+    host = socket.gethostname().split(".")[0].lower() or "unknown-host"
+    log_path = DAILY_DIR / f"{date}-{host}.md"
 
     if not log_path.exists():
         DAILY_DIR.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
-            f"# Daily Log: {today.strftime('%Y-%m-%d')}\n\n## Sessions\n\n## Memory Maintenance\n\n",
+            f"---\ntitle: {date}\ntype: daily\n---\n# {date} ({host})\n\n## Sessions\n\n",
             encoding="utf-8",
         )
 
@@ -75,13 +90,7 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
 
 async def run_flush(context: str) -> str:
     """Use Claude Agent SDK to extract important knowledge from conversation context."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, query
 
     prompt = f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
@@ -120,10 +129,13 @@ respond with exactly: FLUSH_OK
     try:
         async for message in query(
             prompt=prompt,
-            options=ClaudeAgentOptions(
+            options=lean_sdk_options(
                 cwd=str(ROOT),
+                system_prompt="You are a terse note-taker. No tools. Plain text only.",
                 allowed_tools=[],
+                extra_args={"tools": ""},
                 max_turns=2,
+                model=FLUSH_MODEL,
             ),
         ):
             if isinstance(message, AssistantMessage):
@@ -131,7 +143,15 @@ respond with exactly: FLUSH_OK
                     if isinstance(block, TextBlock):
                         response += block.text
             elif isinstance(message, ResultMessage):
-                pass
+                u = message.usage or {}
+                logging.info(
+                    "Model %s cost=$%.4f (notional) ms=%s in=%s cache_create=%s cache_read=%s out=%s",
+                    FLUSH_MODEL, message.total_cost_usd or 0.0, message.duration_ms,
+                    u.get("input_tokens"), u.get("cache_creation_input_tokens"),
+                    u.get("cache_read_input_tokens"), u.get("output_tokens"),
+                )
+                if message.is_error:
+                    response = f"FLUSH_ERROR: result subtype={message.subtype}"
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
@@ -152,8 +172,9 @@ def maybe_trigger_compilation() -> None:
         return
 
     # Check if today's log has already been compiled
-    today_log = f"{now.strftime('%Y-%m-%d')}.md"
-    compile_state_file = SCRIPTS_DIR / "state.json"
+    host = socket.gethostname().split(".")[0].lower() or "unknown-host"
+    today_log = f"{now.strftime('%Y-%m-%d')}-{host}.md"
+    compile_state_file = COMPILE_STATE_FILE
     if compile_state_file.exists():
         try:
             compile_state = json.loads(compile_state_file.read_text(encoding="utf-8"))
@@ -184,7 +205,9 @@ def maybe_trigger_compilation() -> None:
         kwargs["start_new_session"] = True
 
     try:
-        log_handle = open(str(SCRIPTS_DIR / "compile.log"), "a")
+        log_handle = open(str(COMPILE_LOG), "a")
+        log_handle.write(f"\n=== {now.isoformat(timespec='seconds')} compile spawned by flush ===\n")
+        log_handle.flush()
         _sp.Popen(cmd, stdout=log_handle, stderr=_sp.STDOUT, cwd=str(ROOT), **kwargs)
     except Exception as e:
         logging.error("Failed to spawn compile.py: %s", e)
