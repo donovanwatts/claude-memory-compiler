@@ -25,6 +25,7 @@ os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import re
@@ -255,6 +256,23 @@ def maybe_trigger_compilation() -> None:
         logging.error("Failed to spawn compile.py: %s", e)
 
 
+LOCK_FILE = STATE_FILE.parent / "flush.lock"
+
+
+def acquire_flush_lock():
+    """Block until this process holds the one flush lock, and return the open handle.
+
+    A burst of SessionEnds (many T3 threads ending together) starts one flush.py
+    each. Without this they would all call the model at once. The lock makes the
+    model calls run one at a time; the others wait cheaply. The OS drops the lock
+    when the process exits or dies, so a crash cannot leave it stuck. Keep the
+    returned handle open until the model call and the log write are done.
+    """
+    handle = open(LOCK_FILE, "w")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Flush one session's context into the daily log")
     parser.add_argument("context_file", type=Path)
@@ -297,6 +315,8 @@ def main():
         context_file.unlink(missing_ok=True)
         return
 
+    # One model call at a time (see acquire_flush_lock). Released at process exit.
+    lock_handle = acquire_flush_lock()  # noqa: F841 - held for the life of the process
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
     # Run the LLM extraction
