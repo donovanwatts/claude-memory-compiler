@@ -67,6 +67,7 @@ The LLM owns this directory entirely. Humans read it but rarely edit it directly
 knowledge/
 ├── index.md              # Master catalog - every article with one-line summary
 ├── log.md                # Append-only chronological build log
+├── waiting-list.md       # First sightings waiting for a second daily log (not pages)
 ├── concepts/             # Atomic knowledge articles
 ├── connections/          # Cross-cutting insights linking 2+ concepts
 └── qa/                   # Filed query answers (compounding knowledge)
@@ -124,6 +125,20 @@ Headings are plain ISO dates (`## YYYY-MM-DD`), repeated when a day has multiple
 operations, with the full timestamp on the entry's first line. Bracketed headings
 like `## [2026-04-01T14:30:00]` are not OKF-conformant.
 ```
+
+### `knowledge/waiting-list.md` - Concept Waiting List (Twice Rule)
+
+Holds first sightings of candidate concepts before they earn a full `concepts/` page. A line in `waiting-list.md` is not a wiki page. Under the twice rule (dotfiles#1837):
+
+- **First sighting:** When a daily log mentions a new durable idea with no existing concept page and no waiting-list line, add one line under `## Candidates` and create no concept page:
+  ```markdown
+  - **Short Name** | One-sentence gist. | source: daily/2026-11-23-dmacmini.md | date: 2026-11-23
+  ```
+- **Second sighting (different daily log):** When the idea appears again in a different daily log, create the `concepts/` page, cite both daily logs in `sources`, and remove the line from `waiting-list.md`.
+- **Same daily log:** A repeat sighting from the same daily log does not count as a second sighting.
+- **Existing page:** When a concept already has a page, update that page instead of adding a waiting-list line or creating a second page.
+- **Aging:** Lines older than 90 days are listed by the weekly prune report (dotfiles#1832), not deleted by the compiler.
+- **Code enforcement & off switch:** `compile.py` runs a deterministic post-pass (`enforce_twice_rule()`) that rejects any newly created concept page whose `sources` lists fewer than two distinct daily logs, moves its gist to `waiting-list.md`, and logs the rejection. Set `WIKI_TWICE_RULE=0` to disable the twice rule and restore single-sighting behavior.
 
 ---
 
@@ -250,17 +265,19 @@ filed: 2026-04-05
 When processing a daily log:
 
 1. Read the daily log file
-2. Read `knowledge/index.md` to understand current knowledge state
+2. Read `knowledge/index.md` and `knowledge/waiting-list.md` to understand current knowledge state and pending first sightings
 3. Read existing articles that may need updating
-4. For each piece of knowledge found in the log:
-   - If an existing concept article covers this topic: UPDATE it with new information, add the daily log as a source
-   - If it's a new topic: CREATE a new `concepts/` article
+4. For each durable piece of knowledge found in the log (apply the twice rule):
+   - If an existing concept article covers this topic: UPDATE it with new information, add the daily log as a source; never create a second page
+   - If it has a `waiting-list.md` line from a **different** daily log: CREATE a new `concepts/` article citing both daily logs in `sources`, and remove its line from `waiting-list.md`
+   - If it has a `waiting-list.md` line from the **same** daily log: leave it on the waiting list and create no page
+   - If it is a first sighting (no existing page and no waiting-list line): add one line to `waiting-list.md` and create no concept page
 5. If the log reveals a non-obvious connection between 2+ existing concepts: CREATE a `connections/` article
 6. APPEND to `knowledge/log.md` under a plain `## YYYY-MM-DD` heading
-7. (compile.py, not the model) run `okf_reindex.py` to regenerate every `index.md`
+7. (compile.py, not the model) run `enforce_twice_rule()`, `ensure_okf_frontmatter()`, `normalize_log_headings()`, and `okf_reindex.py`
 
 **Important guidelines:**
-- A single daily log may touch 3-10 knowledge articles
+- Zero new concept pages from a daily log is a normal result; never force a quota
 - Prefer updating existing articles over creating near-duplicates
 - Use Obsidian-style `[[wikilinks]]` with full relative paths from knowledge/
 - Write in encyclopedia style - factual, concise, self-contained
@@ -318,6 +335,7 @@ llm-personal-kb/
 |-- knowledge/                       # "Executable" - compiled knowledge (LLM-owned)
 |   |-- index.md                     #   Master catalog - THE retrieval mechanism
 |   |-- log.md                       #   Append-only build log
+|   |-- waiting-list.md              #   First sightings waiting for a second daily log
 |   |-- concepts/                    #   Atomic knowledge articles
 |   |-- connections/                 #   Cross-cutting insights linking 2+ concepts
 |   |-- qa/                          #   Filed query answers (compounding knowledge)
@@ -434,13 +452,15 @@ async for message in query(
 ):
 ```
 
-- Builds a prompt with: AGENTS.md schema, the OKF indexes, and the daily log. Existing
-  articles are NOT inlined (at 1,000 articles that was 16 MB and the CLI exited 1); the
+- Builds a prompt with: AGENTS.md schema, the OKF indexes, the waiting list, and the daily log.
+  Existing articles are NOT inlined (at 1,000 articles that was 16 MB and the CLI exited 1); the
   model reads the few it needs with Read/Grep
-- Claude reads the daily log, decides what concepts to extract, and writes files directly
+- Claude reads the daily log, decides what concepts to extract or hold on the waiting list, and writes files directly
 - `permission_mode="acceptEdits"` auto-approves all file operations
-- After the model finishes: `ensure_okf_frontmatter()` adds any missing `type`/`generated`,
-  `normalize_log_headings()` rewrites bracketed log headings, and `okf_reindex.py` runs
+- After the model finishes: `enforce_twice_rule()` rejects newly created single-source concept pages
+  (moving their gist to `waiting-list.md`) unless `WIKI_TWICE_RULE=0`, `ensure_okf_frontmatter()`
+  adds any missing `type`/`generated`, `normalize_log_headings()` rewrites bracketed log headings,
+  and `okf_reindex.py` runs
 - Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
 - Model: `claude-sonnet-5-5` (`WIKI_COMPILE_MODEL`). Measured 2026-10-31 on a 1,000-article
   bundle: 24 s, ~$0.86 notional per daily log (nothing is billed - see Billing below)
@@ -545,6 +565,7 @@ and CLAUDE.md into context; with the lean options it is 23k (flush) to 50k (comp
 | `WIKI_STATE_DIR` | `~/.local/state/wiki-compiler` | `state.json`, `last-flush.json`, `flush.log`, `compile.log`, `hook.log`, temp context files |
 | `WIKI_COMPILE_MODEL` | `claude-sonnet-5-5` | compile model |
 | `WIKI_FLUSH_MODEL` | `claude-sonnet-5-5` | flush model |
+| `WIKI_TWICE_RULE` | `1` | enforce twice rule (`0`/`false`/`off`/`no` restores single-sighting concept creation) |
 
 Point both `WIKI_*_DIR` variables at a scratch copy to run the pipeline without touching the live vault.
 
