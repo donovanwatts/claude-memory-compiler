@@ -35,6 +35,7 @@ OKF_VALIDATE = OKF_TOOLS_DIR / "okf_validate.py"
 
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 LOG_FILE = KNOWLEDGE_DIR / "log.md"
+WAITING_LIST_FILE = KNOWLEDGE_DIR / "waiting-list.md"
 
 _xdg_state = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 STATE_DIR = Path(os.environ.get("WIKI_STATE_DIR") or (_xdg_state / "wiki-compiler")).expanduser()
@@ -43,6 +44,19 @@ FLUSH_STATE_FILE = STATE_DIR / "last-flush.json"
 FLUSH_LOG = STATE_DIR / "flush.log"
 COMPILE_LOG = STATE_DIR / "compile.log"
 HOOK_LOG = STATE_DIR / "hook.log"
+
+
+def twice_rule_enabled() -> bool:
+    """Return True unless WIKI_TWICE_RULE turns the twice rule off.
+
+    Set WIKI_TWICE_RULE=0 (or false/off/no) to disable the waiting list and
+    post-pass enforcement and restore single-sighting concept creation.
+    """
+    raw = os.environ.get("WIKI_TWICE_RULE", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+TWICE_RULE_ENABLED = twice_rule_enabled()
 
 
 def ensure_state_dir() -> Path:
