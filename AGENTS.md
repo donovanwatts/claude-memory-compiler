@@ -139,6 +139,7 @@ Holds first sightings of candidate concepts before they earn a full `concepts/` 
 - **Existing page:** When a concept already has a page, update that page instead of adding a waiting-list line or creating a second page.
 - **Aging:** Lines older than 90 days are listed by the weekly prune report (dotfiles#1832), not deleted by the compiler.
 - **Code enforcement & off switch:** `compile.py` runs a deterministic post-pass (`enforce_twice_rule()`) that rejects any newly created concept page whose `sources` lists fewer than two distinct daily logs, moves its gist to `waiting-list.md`, and logs the rejection. Set `WIKI_TWICE_RULE=0` to disable the twice rule and restore single-sighting behavior.
+- **Other writers' pages are not judged.** The post-pass never deletes a new concept page that another tool wrote while the compile ran. It tells them apart by the page's own frontmatter: a `generated.by` stamp that is not `claude-memory-compiler/...`, a `research_items` key, or `sources` with no daily log in it. Such a page is kept and printed as `left ... from another writer alone`. The rule does not check a page that has no stamp and no sources: that one is still treated as the compiler's.
 
 ---
 
